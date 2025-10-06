@@ -1,0 +1,69 @@
+name: Python CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: 'poetry'
+
+    - name: Install Poetry
+      uses: snok/install-poetry@v2
+      with:
+        version: 1.8.2
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+
+    - name: Cache dependencies
+      id: cache-deps
+      uses: actions/cache@v3
+      with:
+        path: |
+          .venv
+          ~/.cache/pypoetry/virtualenvs/
+        key: ${{ runner.os }}-py-${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}
+
+    - name: Install dependencies
+      run: |
+        poetry install --no-interaction --no-ansi --with=dev
+
+    - name: Lint with Ruff
+      run: |
+        poetry run ruff check .
+
+    - name: Run tests with coverage
+      run: |
+        poetry run pytest tests/ -v --cov=src --cov-report=xml
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        fail_ci_if_error: false
+
+    - name: Check formatting
+      run: |
+        poetry run black --check .
+        poetry run isort --check-only .
+
+    - name: Security audit with pip-audit
+      run: |
+        poetry run pip-audit --requirement <(poetry export --with dev --format=requirements.txt)
+
+    - name: Type checking with mypy
+      run: |
+        poetry run mypy src/
