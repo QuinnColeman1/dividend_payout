@@ -1,5 +1,4 @@
 import time
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List
@@ -7,7 +6,7 @@ from typing import Any, Dict, List
 import pandas as pd
 import yfinance as yf
 
-warnings.filterwarnings("ignore")
+
 class EnhancedDividendScraper:
     def __init__(self, max_workers: int = 30, batch_size: int = 50):
         """
@@ -46,7 +45,9 @@ class EnhancedDividendScraper:
         try:
             stock = yf.Ticker(ticker)
             info = stock.info
-            hist = stock.history(period="10y", actions=True)
+            # auto_adjust=False returns real closing prices. The default (True) lowers
+            # past prices by later dividends, which inflates historical yields.
+            hist = stock.history(period="10y", actions=True, auto_adjust=False)
 
             # Get comprehensive info
             market_cap = info.get("marketCap", 0)
@@ -68,23 +69,22 @@ class EnhancedDividendScraper:
             if "Dividends" not in hist.columns or hist["Dividends"].empty:
                 return events
 
+            closes = hist["Close"].dropna()
+            metadata["current_price"] = float(closes.iloc[-1]) if not closes.empty else None
+
             # filter positive dividends
             divs = hist["Dividends"][hist["Dividends"] > 0]
             for date, amount in divs.items():
                 date_str = date.strftime("%Y-%m-%d")
-                # get adjusted close if available, else close
-                price = None
-                if "Adj Close" in hist.columns:
-                    price = hist.at[date, "Adj Close"]
-                else:
-                    price = hist.at[date, "Close"]
+                raw_price = hist.at[date, "Close"]
+                price = float(raw_price) if pd.notna(raw_price) and raw_price > 0 else None
 
                 events.append(
                     {
                         **metadata,
                         "ex_dividend_date": date_str,
                         "dividend_amount": float(amount),
-                        "close_price": float(price) if price else None,
+                        "close_price": price,
                         "yield_pct": float(amount / price) if price else None,
                         "data_fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     }
@@ -165,6 +165,7 @@ class EnhancedDividendScraper:
             df["yield_pct"] = df["yield_pct"].astype(float)
             df["market_cap"] = df["market_cap"].astype(float)
             df["avg_volume"] = df["avg_volume"].astype(float)
+            df["current_price"] = df["current_price"].astype(float)
 
         return df
 

@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -32,6 +32,7 @@ default_session_items: Dict[str, Any] = {
     "last_scrape_timestamp": None,  # Will hold timestamp of last data refresh
     "last_error": None,  # Will hold the last error message
     "tickers_data": None,  # Will hold the tickers data dictionary
+    "loaded_tickers": [],  # Tickers the current optimizer was built from
 }
 for k, v in default_session_items.items():
     if k not in st.session_state:
@@ -42,151 +43,106 @@ for k, v in default_session_items.items():
 # Data Loading & Processing
 # ==============================
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_dividend_data(tickers: list, years: int = 5) -> dict:
+def fetch_dividend_data(tickers: tuple, years: int = 5) -> Tuple[Dict[str, Any], List[str]]:
     """
-    Fetch dividend data for given tickers using yfinance.
-    
+    Fetch daily prices and dividends for the given tickers using yfinance.
+
+    No Streamlit elements are created here: cached functions replay their UI
+    calls, so problems are returned as messages for the caller to display.
+
     Args:
-        tickers: List of stock ticker symbols
-        years: Number of years of historical data to fetch
-        
+        tickers: Ticker symbols (a tuple so the cache key is hashable)
+        years: Number of years of history to fetch
+
     Returns:
-        Dictionary with tickers as keys and their data as values
+        (data, problems): ticker -> {'dividends', 'close', 'info'}, and a list of warnings
     """
-    data = {}
+    data: Dict[str, Any] = {}
+    problems: List[str] = []
     end_date = datetime.now()
     start_date = end_date - timedelta(days=365 * years)
-    
-    # Filter out empty or invalid tickers
-    tickers = [t for t in tickers if t and isinstance(t, str) and t.strip()]
-    
-    if not tickers:
-        return {}
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for i, ticker in enumerate(tickers):
+
+    for raw_ticker in tickers:
+        ticker = raw_ticker.strip().upper()
+        if not ticker:
+            continue
         try:
-            status_text.text(f"Fetching data for {ticker}...")
-            progress_bar.progress((i + 1) / len(tickers))
-            
-            ticker = ticker.strip().upper()
             stock = yf.Ticker(ticker)
-            
-            # Get historical data
-            hist = stock.history(start=start_date, end=end_date, interval="1mo")
-            
+            # Daily bars keep exact ex-dividend dates; auto_adjust=False keeps real
+            # (not dividend-adjusted) closing prices so historical yields are correct.
+            hist = stock.history(start=start_date, end=end_date, interval="1d", auto_adjust=False, actions=True)
             if hist.empty:
-                st.warning(f"No data found for {ticker}")
+                problems.append(f"No data found for {ticker}")
                 continue
-                
-            # Get company info
-            info = {}
+
+            info: Dict[str, Any] = {}
             try:
-                info = stock.info
+                info = stock.info or {}
             except Exception as e:
-                st.warning(f"Could not fetch info for {ticker}: {str(e)}")
-            
-            # Store the data
-            data[ticker] = {
-                'dividends': hist['Dividends'] if 'Dividends' in hist.columns else pd.Series(dtype=float),
-                'close': hist['Close'],
-                'info': info  # Store all info in a nested dict
-            }
-            
+                problems.append(f"Could not fetch info for {ticker}: {e}")
+
+            dividends = hist["Dividends"] if "Dividends" in hist.columns else pd.Series(dtype=float)
+            if dividends[dividends > 0].empty:
+                problems.append(f"{ticker} paid no dividends in the last {years} years and was skipped")
+
+            data[ticker] = {"dividends": dividends, "close": hist["Close"], "info": info}
         except Exception as e:
-            st.error(f"Error fetching data for {ticker}: {str(e)}")
-    
-    status_text.empty()
-    progress_bar.empty()
-    
-    if not data:
-        st.error("No valid ticker data could be loaded. Please check your ticker symbols and try again.")
-    
-    return data
+            problems.append(f"Error fetching data for {ticker}: {e}")
+
+    return data, problems
 
 
-def init_optimizer(tickers: list):
+def init_optimizer(tickers: List[str]) -> None:
     """
-    Initialize the optimizer with data from yfinance.
-    
+    Fetch data for the tickers and build the optimizer.
+
     Args:
-        tickers: List of stock ticker symbols to include in the optimization
+        tickers: Ticker symbols to include in the optimization
     """
     if not tickers:
         st.error("Please enter at least one valid ticker symbol.")
         return
-        
-    # Clear any previous error
-    if 'last_error' in st.session_state:
-        st.session_state.last_error = None
-    
+
+    st.session_state.last_error = None
     try:
-        with st.spinner("Fetching market data..."):
-            # Always fetch fresh data when initializing
-            st.session_state.tickers_data = fetch_dividend_data(tickers)
-            
-            if not st.session_state.tickers_data:
-                st.error("No valid ticker data available. Cannot initialize optimizer.")
-                return
-                
-            st.session_state.optimizer = create_optimizer_wrapper(st.session_state.tickers_data)
-            
-            # Clear any previous errors on successful initialization
-            if 'last_error' in st.session_state:
-                del st.session_state.last_error
-                
+        with st.spinner(f"Fetching market data for {len(tickers)} tickers..."):
+            data, problems = fetch_dividend_data(tuple(tickers))
+        for problem in problems:
+            st.warning(problem)
+
+        st.session_state.tickers_data = data
+        if not data:
+            st.session_state.optimizer = None
+            st.error("No valid ticker data could be loaded. Check your ticker symbols and try again.")
+            return
+
+        st.session_state.optimizer = create_optimizer_wrapper(data)
+        st.session_state.loaded_tickers = list(tickers)
+        st.session_state.last_scrape_timestamp = datetime.now()
     except Exception as e:
-        error_msg = f"Failed to initialize optimizer: {str(e)}"
+        st.session_state.optimizer = None
+        error_msg = f"Failed to initialize optimizer: {e}"
         st.error(error_msg)
         st.session_state.last_error = error_msg
 
 
-def normalize_result(raw: dict) -> dict:
-    """
-    Ensure result dict has consistent key names used by the UI.
-    """
-    if raw is None:
+def normalize_result(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Copy the fields the UI uses, converting numpy arrays to lists."""
+    if not raw:
         return {}
-
-    total_capital = raw.get(
-        "total_capital_used",
-        raw.get("total_capital_needed", raw.get("capital_required", 0.0)),
-    )
-    actual_div = raw.get(
-        "actual_annual_dividend",
-        raw.get("actual_dividend", raw.get("achieved_dividend", 0.0)),
-    )
-    monthly_cf = raw.get(
-        "monthly_cashflows",
-        raw.get("monthly_cash_flows", raw.get("monthly_dividends", [])),
-    )
-
-    if monthly_cf is not None and len(monthly_cf) > 0:
-        if isinstance(monthly_cf, np.ndarray):
-            monthly_cf = monthly_cf.tolist()
-        min_month = raw.get("min_monthly", min(monthly_cf))
-        max_month = raw.get("max_monthly", max(monthly_cf))
-        std_cf = raw.get("cashflow_std", float(np.std(monthly_cf, ddof=0)))
-    else:
-        min_month = raw.get("min_monthly", 0.0)
-        max_month = raw.get("max_monthly", 0.0)
-        std_cf = raw.get("cashflow_std", 0.0)
-
-    portfolio = raw.get("portfolio", [])
-
-    normalized = {
+    monthly_cf = raw.get("monthly_cashflows", [])
+    if isinstance(monthly_cf, np.ndarray):
+        monthly_cf = monthly_cf.tolist()
+    return {
         "status": raw.get("status", "unknown"),
-        "total_capital_used": total_capital,
-        "actual_annual_dividend": actual_div,
-        "cashflow_std": std_cf,
-        "monthly_cashflows": monthly_cf,
-        "min_monthly": min_month,
-        "max_monthly": max_month,
-        "portfolio": portfolio,
+        "total_capital_used": raw.get("total_capital_used", 0.0),
+        "actual_annual_dividend": raw.get("actual_annual_dividend", 0.0),
+        "cashflow_std": raw.get("cashflow_std", 0.0),
+        "monthly_cashflows": list(monthly_cf),
+        "min_monthly": raw.get("min_monthly", 0.0),
+        "max_monthly": raw.get("max_monthly", 0.0),
+        "portfolio": raw.get("portfolio", []),
     }
-    return normalized
 
 
 def record_result(key: str, result: dict):
@@ -200,29 +156,20 @@ def get_latest_result():
     return key, st.session_state.results[key]
 
 
-def run_scraper():
+def run_scraper() -> Tuple[bool, str, str]:
     """
-    Refresh market data by clearing the cache and forcing a refetch.
-    
+    Clear cached market data and the optimizer so the next initialization refetches.
+
     Returns:
-        Tuple of (success: bool, message: str, error: str)
+        Tuple of (success, message, error)
     """
     try:
-        # Clear the cached data
-        if 'tickers_data' in st.session_state:
-            st.session_state.tickers_data = None
-            
-        # Clear the optimizer to force reinitialization
-        if 'optimizer' in st.session_state:
-            st.session_state.optimizer = None
-            
-        # Clear any cached data
+        st.session_state.tickers_data = None
+        st.session_state.optimizer = None
         st.cache_data.clear()
-        
-        return True, "Market data refresh initiated. Please wait while we fetch the latest data...", ""
-        
+        return True, "Cached market data cleared. Fetching the latest data...", ""
     except Exception as e:
-        return False, "", f"Error refreshing market data: {str(e)}"
+        return False, "", f"Error refreshing market data: {e}"
 
 
 def friendly_status(status: str) -> str:
@@ -259,7 +206,7 @@ with st.sidebar.expander("Ticker Selection", expanded=True):
         init_optimizer(tickers)
         
     # Refresh data button
-    if st.button(" Refresh Market Data"):
+    if st.button("🔄 Refresh Market Data"):
         success, msg, error = run_scraper()
         if success:
             st.success(msg)
@@ -269,7 +216,10 @@ with st.sidebar.expander("Ticker Selection", expanded=True):
             st.error(f"Error: {error}")
 
 # Display status
-if 'tickers_data' in st.session_state and st.session_state.tickers_data:
+if st.session_state.optimizer is not None and sorted(tickers) != sorted(st.session_state.loaded_tickers):
+    st.sidebar.warning("Ticker list changed. Click **Initialize Optimizer** to load the new tickers.")
+
+if st.session_state.tickers_data:
     st.sidebar.success(f"Loaded data for {len(st.session_state.tickers_data)} tickers")
     
     # Display ticker info
@@ -290,7 +240,7 @@ st.sidebar.info(
     """
 **Dividend Portfolio Optimizer**
 
-This app helps you build optimal dividend portfolios from S&P 500 stocks:
+This app helps you build optimal dividend portfolios from the stocks and ETFs you choose:
 - Minimize capital requirements
 - Smooth monthly cash flows
 - Multi-objective optimization
@@ -391,13 +341,6 @@ if page == "Input Parameters":
                 else:
                     with st.spinner("Running optimization..."):
                         try:
-                            # Get the list of tickers from the session state
-                            if 'tickers' in st.session_state and st.session_state.tickers:
-                                init_optimizer(st.session_state.tickers)
-                            else:
-                                st.error("No tickers available. Please add tickers first.")
-                                st.stop()
-
                             # Run optimization
                             if optimization_type == "Minimize Capital":
                                 raw = st.session_state.optimizer.minimize_capital(
@@ -413,6 +356,7 @@ if page == "Input Parameters":
                                     target_annual_dividend=target_dividend,
                                     budget_constraint=budget_constraint,
                                     max_position_pct=max_position_pct,
+                                    min_yield_threshold=min_yield_threshold,
                                 )
                                 record_result("smooth_cashflow", raw)
 
@@ -423,6 +367,7 @@ if page == "Input Parameters":
                                     lambda_smoothness=lambda_smoothness,
                                     max_position_pct=max_position_pct,
                                     budget_constraint=budget_constraint,
+                                    min_yield_threshold=min_yield_threshold,
                                 )
                                 record_result("multi_objective", raw)
 
