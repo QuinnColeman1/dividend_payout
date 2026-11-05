@@ -38,7 +38,7 @@ update: ## Update all dependencies
 security: ## Run security checks with bandit and pip-audit
 	@echo "🔒 Running security checks..."
 	$(POETRY) bandit -r app/ src/
-	$(POETRY) pip-audit --ignore-vuln GHSA-4xh5-x5gv-qwph
+	$(POETRY) pip-audit --ignore-vuln GHSA-4xh5-x5gv-qwph --skip-editable
 
 clean: ## Remove all cache and build files
 	find . -type f -name '*.py[co]' -delete
